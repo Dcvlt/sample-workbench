@@ -1,0 +1,10 @@
+[package]
+name = "sample-workbench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "=0.33.3"
+hound = "=3.5.1"
+rfd = "=0.15.4"
+rodio = { version = "=0.21.1", default-features = false, features = ["playback"] }
