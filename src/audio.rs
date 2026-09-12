@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
+#[derive(Clone)]
 pub(crate) struct AudioClip {
     pub(crate) channels: u16,
     pub(crate) sample_rate: u32,
     pub(crate) duration_seconds: f64,
-    pub(crate) samples: Vec<f32>,
+    pub(crate) samples: Arc<[f32]>,
 }
 
 pub(crate) fn load_audio(path: &Path) -> Result<AudioClip, hound::Error> {
@@ -45,6 +46,9 @@ pub(crate) fn load_audio(path: &Path) -> Result<AudioClip, hound::Error> {
         ));
     }
 
+    if !samples.len().is_multiple_of(usize::from(spec.channels)) {
+        return Err(hound::Error::FormatError("incomplete audio frame"));
+    }
     let frame_count = samples.len() / usize::from(spec.channels);
     let duration_seconds = frame_count as f64 / f64::from(spec.sample_rate);
 
@@ -52,6 +56,6 @@ pub(crate) fn load_audio(path: &Path) -> Result<AudioClip, hound::Error> {
         channels: spec.channels,
         sample_rate: spec.sample_rate,
         duration_seconds,
-        samples,
+        samples: samples.into(),
     })
 }
