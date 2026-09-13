@@ -7,6 +7,7 @@ pub(crate) enum WaveformAction {
     Seek(f64),
     Select(Range<usize>),
     SelectMarkers(Vec<usize>),
+    AddMarkers(Vec<usize>),
 }
 
 fn selection_range(anchor: usize, cursor: usize, frames: usize) -> Option<Range<usize>> {
@@ -30,6 +31,7 @@ pub(crate) struct WaveformCache {
     view: Option<Range<usize>>,
     cached_view: Option<Range<usize>>,
     pub(crate) markers: Vec<usize>,
+    pub(crate) timing_targets: Vec<(usize, usize)>,
     pub(crate) selected_marker: Option<usize>,
     pub(crate) selected_markers: Vec<usize>,
     marker_anchor: Option<usize>,
@@ -99,25 +101,21 @@ impl WaveformCache {
         }
     }
 
-    // Emit a typed interaction; the app owns selection and playback state.
-    pub(crate) fn show(
+    pub(crate) fn controls(
         &mut self,
         ui: &mut egui::Ui,
         clip: &AudioClip,
-        gain: f32,
-        progress: f32,
         selection: Option<&Range<usize>>,
-    ) -> Option<WaveformAction> {
+    ) {
         let frames = clip.samples.len() / usize::from(clip.channels);
         if frames == 0 {
-            return None;
+            return;
         }
         let mut view = self.view.clone().unwrap_or(0..frames);
         self.spectrum.controls(ui);
-        self.spectrum.update(clip, ui.ctx());
         ui.horizontal_wrapped(|ui| {
             theme::segments(ui, |ui| {
-                if ui.add(egui::Button::new("Fit clip")).clicked() {
+                if ui.button("Fit clip").clicked() {
                     view = 0..frames;
                 }
                 if ui
@@ -141,6 +139,28 @@ impl WaveformCache {
                     .color(theme::MUTED),
             );
         });
+        self.view = Some(view);
+    }
+
+    // Emit a typed interaction; the app owns selection and playback state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        clip: &AudioClip,
+        gain: f32,
+        progress: f32,
+        selection: Option<&Range<usize>>,
+        grid_bpm: f32,
+        grid_subdivision: u32,
+        grid_enabled: bool,
+    ) -> Option<WaveformAction> {
+        let frames = clip.samples.len() / usize::from(clip.channels);
+        if frames == 0 {
+            return None;
+        }
+        let mut view = self.view.clone().unwrap_or(0..frames);
+        self.spectrum.update(clip, ui.ctx());
         let span = view.len();
         if span < frames {
             let mut start = view.start;
@@ -199,14 +219,53 @@ impl WaveformCache {
         let frame_x = |frame: f64| {
             rect.left() + ((frame - view.start as f64) / view.len() as f64) as f32 * rect.width()
         };
+        if grid_enabled && grid_bpm > 0.0 {
+            let step_seconds = 60.0 / f64::from(grid_bpm) / f64::from(grid_subdivision.max(1));
+            let rate = f64::from(clip.sample_rate);
+            let first = (view.start as f64 / rate / step_seconds).floor() as i64 - 1;
+            let last = (view.end as f64 / rate / step_seconds).ceil() as i64 + 1;
+            for beat in first..=last {
+                let x = frame_x(beat as f64 * step_seconds * rate);
+                if x >= rect.left() && x <= rect.right() {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(255, 97, 58, 72),
+                        ),
+                    );
+                }
+            }
+            // Show proposed snap destinations without changing the source markers.
+            for &(marker, target) in &self.timing_targets {
+                let snapped_frame = target as f64;
+                let from = frame_x(marker as f64);
+                let to = frame_x(snapped_frame);
+                if (from - to).abs() > 1.0 && to >= rect.left() && to <= rect.right() {
+                    painter.line_segment(
+                        [egui::pos2(to, rect.top()), egui::pos2(to, rect.bottom())],
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(255, 180, 80, 120),
+                        ),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(from, rect.top() + 4.0),
+                            egui::pos2(to, rect.top() + 4.0),
+                        ],
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(255, 180, 80, 150),
+                        ),
+                    );
+                }
+            }
+        }
         let ticks = (rect.width() / 100.0).floor().max(2.0) as usize;
         for tick in 0..=ticks {
             let fraction = tick as f32 / ticks as f32;
             let x = rect.left() + fraction * rect.width();
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(40, 43, 48)),
-            );
             let align = if tick == 0 {
                 egui::Align2::LEFT_CENTER
             } else if tick == ticks {
@@ -227,17 +286,6 @@ impl WaveformCache {
             );
         }
         let show_waveform = self.spectrum.mode != crate::spectrum_view::Mode::Spectrogram;
-        for fraction in if show_waveform {
-            &[0.05, 0.275, 0.725, 0.95][..]
-        } else {
-            &[]
-        } {
-            let y = rect.top() + rect.height() * fraction;
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(32, 35, 40)),
-            );
-        }
         let center_y = rect.center().y;
         if show_waveform {
             painter.line_segment(
@@ -449,10 +497,10 @@ impl WaveformCache {
         {
             self.marker_anchor = response
                 .interact_pointer_pos()
-                .and_then(|p| nearest_marker(p.x));
+                .map(|p| (fraction_at(p.x) * frames as f64).round() as usize);
         }
         if response.drag_started_by(egui::PointerButton::Primary) {
-            self.selection_anchor = if ui.input(|input| input.modifiers.shift) {
+            self.selection_anchor = if !ui.input(|input| input.modifiers.ctrl) {
                 ui.input(|input| input.pointer.press_origin())
                     .map(|pointer| (fraction_at(pointer.x) * frames as f64).round() as usize)
             } else {
@@ -469,21 +517,29 @@ impl WaveformCache {
             if let Some(anchor) = self.marker_anchor {
                 let cursor = (fraction * frames as f64).round() as usize;
                 let (start, end) = (anchor.min(cursor), anchor.max(cursor));
-                action = Some(WaveformAction::SelectMarkers(
-                    self.markers
-                        .iter()
-                        .copied()
-                        .filter(|&marker| marker >= start && marker <= end)
-                        .collect(),
-                ));
-            } else if let Some(marker) = nearest_marker(pointer.x)
-                && ui.input(|i| i.modifiers.ctrl)
+                let selected = self
+                    .markers
+                    .iter()
+                    .copied()
+                    .filter(|&marker| marker >= start && marker <= end)
+                    .collect();
+                action = Some(if ui.input(|i| i.modifiers.ctrl) {
+                    WaveformAction::AddMarkers(selected)
+                } else {
+                    WaveformAction::SelectMarkers(selected)
+                });
+            } else if ui.input(|i| i.modifiers.ctrl)
+                && let Some(marker) = nearest_marker(pointer.x)
             {
-                action = Some(WaveformAction::SelectMarkers(vec![marker]));
+                action = Some(if ui.input(|i| i.modifiers.ctrl) {
+                    WaveformAction::AddMarkers(vec![marker])
+                } else {
+                    WaveformAction::SelectMarkers(vec![marker])
+                });
             } else if let Some(anchor) = self.selection_anchor {
                 let cursor = (fraction * frames as f64).round() as usize;
                 action = selection_range(anchor, cursor, frames).map(WaveformAction::Select);
-            } else if !ui.input(|input| input.modifiers.shift) {
+            } else if !ui.input(|input| input.modifiers.ctrl) {
                 action = Some(WaveformAction::Seek(fraction));
             }
         }
@@ -498,6 +554,63 @@ impl WaveformCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plain_drag_across_markers_selects_audio() {
+        let ctx = egui::Context::default();
+        let clip = AudioClip {
+            channels: 1,
+            sample_rate: 100,
+            duration_seconds: 10.0,
+            samples: vec![0.0; 1000].into(),
+        };
+        let mut cache = WaveformCache {
+            markers: (0..1000).collect(),
+            ..Default::default()
+        };
+        let mut selected = false;
+        for (x, down) in [
+            (150., None),
+            (150., Some(true)),
+            (450., None),
+            (450., Some(false)),
+        ] {
+            let pos = egui::pos2(x, 180.);
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if let Some(pressed) = down {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 600.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(action) = cache.show(ui, &clip, 1., 0., None, 120., 1, false) {
+                            assert!(!matches!(
+                                action,
+                                WaveformAction::SelectMarkers(_) | WaveformAction::AddMarkers(_)
+                            ));
+                            if let WaveformAction::Select(range) = action {
+                                assert!(range.len() > 300);
+                                selected = true;
+                            }
+                        }
+                    });
+                },
+            );
+        }
+        assert!(selected);
+    }
 
     #[test]
     fn middle_and_right_drag_pan_without_emitting_edit_or_seek() {
@@ -539,7 +652,11 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            assert!(cache.show(ui, &clip, 1.0, 0.0, Some(&(250..350))).is_none());
+                            assert!(
+                                cache
+                                    .show(ui, &clip, 1.0, 0.0, Some(&(250..350)), 120.0, 1, false)
+                                    .is_none()
+                            );
                         });
                     },
                 );
@@ -587,7 +704,7 @@ mod tests {
             };
             let _ = context.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = cache.show(ui, &clip, 1.0, 0.0, None);
+                    action = cache.show(ui, &clip, 1.0, 0.0, None, 120.0, 1, false);
                 });
             });
             action

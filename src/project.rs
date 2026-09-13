@@ -1,4 +1,4 @@
-use crate::edits::{EditHistory, EditState};
+use crate::edits::{EditHistory, EditState, Piece};
 use std::{
     fs,
     ops::Range,
@@ -60,6 +60,45 @@ pub(crate) fn save(path: &Path, data: &ProjectData) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(",")
     ));
+    if let Some(pieces) = &data.state.timeline {
+        text = text.replacen(
+            "SAMPLE_WORKBENCH_PROJECT=1",
+            "SAMPLE_WORKBENCH_PROJECT=2",
+            1,
+        );
+        let encoded = pieces
+            .iter()
+            .map(|piece| {
+                format!(
+                    "{}:{}:{}:{}",
+                    piece
+                        .source
+                        .map_or("-".to_owned(), |source| source.to_string()),
+                    piece.len,
+                    piece.fade_in,
+                    piece.fade_out
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        text.push_str(&format!("timeline={encoded}\n"));
+    }
+    if !data.state.inserted.is_empty() {
+        text = text.replacen(
+            "SAMPLE_WORKBENCH_PROJECT=2",
+            "SAMPLE_WORKBENCH_PROJECT=3",
+            1,
+        );
+        text.push_str(&format!(
+            "inserted={}\n",
+            data.state
+                .inserted
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     fs::write(path, text).map_err(|e| format!("Could not save project: {e}"))
 }
 
@@ -71,7 +110,10 @@ pub(crate) fn load(path: &Path) -> Result<ProjectData, String> {
             values.insert(k, v);
         }
     }
-    if values.get("SAMPLE_WORKBENCH_PROJECT").copied() != Some("1") {
+    if !matches!(
+        values.get("SAMPLE_WORKBENCH_PROJECT").copied(),
+        Some("1" | "2" | "3")
+    ) {
         return Err("Not a Sample Workbench project".into());
     }
     let selection = values
@@ -99,6 +141,63 @@ pub(crate) fn load(path: &Path) -> Result<ProjectData, String> {
             .parse()
             .map_err(|_| "invalid bypass")?,
         state: EditState {
+            inserted: values
+                .get("inserted")
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    v.split(',')
+                        .map(|value| {
+                            let sample = value
+                                .parse::<f32>()
+                                .map_err(|_| "invalid pasted sample".to_owned())?;
+                            if !sample.is_finite() {
+                                return Err("invalid pasted sample".to_owned());
+                            }
+                            Ok(sample)
+                        })
+                        .collect::<Result<Vec<_>, String>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            timeline: values
+                .get("timeline")
+                .map(|value| {
+                    if value.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    value
+                        .split(',')
+                        .map(|part| {
+                            let fields: Vec<_> = part.split(':').collect();
+                            if fields.len() != 4 {
+                                return Err("invalid timing slice".to_owned());
+                            }
+                            let number = |value: &str| {
+                                value
+                                    .parse::<usize>()
+                                    .map_err(|_| "invalid timing value".to_owned())
+                            };
+                            let source = if fields[0] == "-" {
+                                None
+                            } else {
+                                Some(number(fields[0])?)
+                            };
+                            let len = number(fields[1])?;
+                            let fade_in = number(fields[2])?;
+                            let fade_out = number(fields[3])?;
+                            if len == 0 || fade_in > len || fade_out > len {
+                                return Err("invalid timing length".to_owned());
+                            }
+                            Ok(Piece {
+                                source,
+                                len,
+                                fade_in,
+                                fade_out,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()
+                })
+                .transpose()?,
             fade_frames: values
                 .get("fade_frames")
                 .unwrap_or(&"0")
@@ -145,17 +244,36 @@ mod tests {
         ));
         let data = ProjectData {
             source: PathBuf::from("test.wav"),
-            state: EditState::default(),
+            state: EditState {
+                timeline: Some(vec![
+                    Piece {
+                        source: Some(4),
+                        len: 5,
+                        fade_in: 2,
+                        fade_out: 1,
+                    },
+                    Piece {
+                        source: None,
+                        len: 3,
+                        fade_in: 0,
+                        fade_out: 0,
+                    },
+                ]),
+                ..Default::default()
+            },
             selection: Some(4..9),
             gain: 0.5,
             looping: true,
             bypass: false,
             markers: vec![4, 8, 12],
         };
+        let mut data = data;
+        data.state.paste(20, 1, 0..0, &[0.125, -0.875]);
         save(&path, &data).unwrap();
         let reopened = load(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(reopened.markers, data.markers);
+        assert!(reopened.state == data.state);
         assert_eq!(reopened.selection, data.selection);
         assert_eq!(reopened.gain, 0.5);
     }

@@ -2,6 +2,41 @@ use crate::audio::AudioClip;
 use rodio::{Source, source::SeekError};
 use std::{ops::Range, sync::Arc, time::Duration};
 
+// Audition-only, four-times oversampled soft clipping with a speaker-style
+// high-pass and four-pole low-pass. No audio callback allocations.
+pub(crate) fn distortion_preview(clip: &AudioClip, drive_db: f32) -> AudioClip {
+    let channels = usize::from(clip.channels);
+    let rate = clip.sample_rate as f32 * 4.0;
+    let low = 1.0 - (-std::f32::consts::TAU * 4200.0 / rate).exp();
+    let high = 1.0 - (-std::f32::consts::TAU * 85.0 / rate).exp();
+    let drive = 10.0_f32.powf(drive_db.clamp(0.0, 48.0) / 20.0);
+    let mut previous = vec![0.0; channels];
+    let mut dc = vec![0.0; channels];
+    let mut filters = vec![[0.0; 4]; channels];
+    let mut samples = Vec::with_capacity(clip.samples.len());
+    for frame in clip.samples.chunks_exact(channels) {
+        for channel in 0..channels {
+            let mut output = 0.0;
+            for step in 1..=4 {
+                let input =
+                    previous[channel] + (frame[channel] - previous[channel]) * step as f32 / 4.0;
+                dc[channel] += high * (input - dc[channel]);
+                output = ((input - dc[channel]) * drive).tanh();
+                for pole in &mut filters[channel] {
+                    *pole += low * (output - *pole);
+                    output = *pole;
+                }
+            }
+            previous[channel] = frame[channel];
+            samples.push(output * 0.35);
+        }
+    }
+    AudioClip {
+        samples: samples.into(),
+        ..clip.clone()
+    }
+}
+
 // Playback positions inside the source are relative to the selected region.
 // The UI uses absolute clip time; conversion happens at this boundary.
 #[derive(Clone)]
@@ -205,6 +240,38 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audition_is_bounded_preserves_stereo_and_rolls_off_highs() {
+        let tone = |hz: f32| AudioClip {
+            channels: 2,
+            sample_rate: 48000,
+            duration_seconds: 0.1,
+            samples: (0..4800)
+                .flat_map(|i| {
+                    [
+                        (std::f32::consts::TAU * hz * i as f32 / 48000.).sin() * 0.1,
+                        0.0,
+                    ]
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let low = tone(1000.0);
+        let original = low.samples.clone();
+        let output = distortion_preview(&low, 30.0);
+        assert_eq!(original, low.samples);
+        assert_eq!(output.samples.len(), low.samples.len());
+        assert!(
+            output
+                .samples
+                .iter()
+                .all(|sample| sample.is_finite() && sample.abs() <= 0.35)
+        );
+        assert!(output.samples.chunks_exact(2).all(|frame| frame[1] == 0.0));
+        let high = distortion_preview(&tone(12000.0), 30.0);
+        let energy = |clip: &AudioClip| clip.samples.iter().skip(1000).map(|v| v * v).sum::<f32>();
+        assert!(energy(&high) < energy(&output) * 0.1);
+    }
     fn clip() -> AudioClip {
         AudioClip {
             channels: 2,
@@ -225,6 +292,8 @@ mod tests {
                 silences: std::iter::once(1..2).collect(),
                 fade_frames: 0,
                 deletions: Vec::new(),
+                timeline: None,
+                inserted: Vec::new(),
             },
         );
         let source = ClipSource::new(&preview, PlaybackRegion::new(&preview, 1..3).unwrap(), true);
@@ -232,6 +301,25 @@ mod tests {
             source.take(8).collect::<Vec<_>>(),
             vec![0., 0., 0.5, 0.6, 0., 0., 0.5, 0.6]
         );
+    }
+    #[test]
+    fn loop_repeats_quantized_audio() {
+        let original = clip();
+        let state = crate::edits::quantize(
+            &Default::default(),
+            original.samples.len() / usize::from(original.channels),
+            &[(1, 2)],
+            0,
+        )
+        .unwrap();
+        let rendered = crate::edits::render(&original, &state);
+        let source = ClipSource::new(
+            &rendered,
+            PlaybackRegion::new(&rendered, 1..3).unwrap(),
+            true,
+        );
+        let expected = rendered.samples[2..6].repeat(2);
+        assert_eq!(source.take(8).collect::<Vec<_>>(), expected);
     }
     #[test]
     fn finite_region_excludes_surrounding_samples() {

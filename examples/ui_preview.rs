@@ -1,6 +1,28 @@
 // Developer-only native rendering harness: cargo run --example ui_preview -- <wav|empty> <output.bmp> [width height]
-#[path = "../src/app.rs"]
-mod app;
+mod app {
+    include!("../src/app.rs");
+
+    pub fn toolbar_fixture(app: &mut SampleWorkbench, mode: &str) {
+        if !mode.starts_with("toolbar-") {
+            return;
+        }
+        app.workflow = match mode {
+            "toolbar-edit" | "toolbar-timing" => Workflow::Edit,
+            "toolbar-export" => Workflow::Export,
+            _ => Workflow::Analyze,
+        };
+        if let Some(clip) = &app.audio_info {
+            let rate = clip.sample_rate as usize;
+            app.attack_markers = (1..8).map(|second| second * rate).collect();
+            if mode == "toolbar-timing" {
+                app.attack_markers = (1..8).map(|second| second * rate + rate / 20).collect();
+                app.selected_attack_markers = app.attack_markers.clone();
+                app.grid_enabled = true;
+                app.preview_timing = true;
+            }
+        }
+    }
+}
 #[path = "../src/audio.rs"]
 mod audio;
 #[path = "../src/edits.rs"]
@@ -150,12 +172,13 @@ fn main() -> eframe::Result {
             ..Default::default()
         },
         Box::new(move |cc| {
-            let app = if args.get(1).is_some_and(|s| s == "empty") {
+            let mut app = if args.get(1).is_some_and(|s| s == "empty") {
                 theme::apply(&cc.egui_ctx);
                 app::SampleWorkbench::default()
             } else {
                 app::SampleWorkbench::new(&cc.egui_ctx)
             };
+            app::toolbar_fixture(&mut app, args.get(5).map_or("", String::as_str));
             Ok(Box::new(Preview {
                 app,
                 frame: 0,

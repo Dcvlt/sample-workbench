@@ -48,6 +48,15 @@ pub(crate) struct SampleWorkbench {
     spectral_detector: bool,
     detect_requested: bool,
     detection_work: Option<DetectionWork>,
+    grid_enabled: bool,
+    grid_bpm: f32,
+    grid_subdivision: u32,
+    preview_timing: bool,
+    audio_clipboard: Option<Vec<f32>>,
+    distortion_enabled: bool,
+    distortion_drive: f32,
+    audition_audio: Option<AudioClip>,
+    recent_files: Vec<PathBuf>,
 }
 
 impl Default for SampleWorkbench {
@@ -68,7 +77,7 @@ impl Default for SampleWorkbench {
             original_audio: None,
             edits: EditHistory::default(),
             bypass_edits: false,
-            fade_ms: 2.0,
+            fade_ms: 5.0,
             project_path: None,
             attack_markers: Vec::new(),
             selected_attack_markers: Vec::new(),
@@ -78,11 +87,58 @@ impl Default for SampleWorkbench {
             spectral_detector: true,
             detect_requested: false,
             detection_work: None,
+            grid_enabled: false,
+            grid_bpm: 120.0,
+            grid_subdivision: 1,
+            preview_timing: false,
+            audio_clipboard: None,
+            distortion_enabled: false,
+            distortion_drive: 30.0,
+            audition_audio: None,
+            recent_files: Self::load_recent(),
         }
     }
 }
 
 impl SampleWorkbench {
+    fn recent_path() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|path| PathBuf::from(path).join("SampleForge").join("recent.txt"))
+    }
+    fn load_recent() -> Vec<PathBuf> {
+        Self::recent_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| text.lines().take(10).map(PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+    fn remember_recent(&mut self, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.recent_files.retain(|entry| entry != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(10);
+        if let Some(path) = Self::recent_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                path,
+                self.recent_files
+                    .iter()
+                    .map(|p| p.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
+    fn rebuild_audition(&mut self) {
+        self.audition_audio = if self.distortion_enabled {
+            self.audio_info
+                .as_ref()
+                .map(|clip| crate::playback::distortion_preview(clip, self.distortion_drive))
+        } else {
+            None
+        };
+    }
     pub(crate) fn new(ctx: &egui::Context) -> Self {
         theme::apply(ctx);
         let mut app = Self::default();
@@ -96,9 +152,11 @@ impl SampleWorkbench {
     fn open_path(&mut self, path: PathBuf) {
         match load_audio(&path) {
             Ok(clip) => {
+                self.audio_clipboard = None;
                 self.playback = None;
                 self.position_seconds = 0.0;
                 self.waveform.clear();
+                self.preview_timing = false;
                 self.selection = None;
                 self.selection_pending = false;
                 self.export_status = None;
@@ -106,13 +164,17 @@ impl SampleWorkbench {
                 self.original_audio = Some(clip.clone());
                 self.edits = EditHistory::default();
                 self.bypass_edits = false;
-                self.fade_ms = 2.0;
+                self.fade_ms = 5.0;
                 self.project_path = None;
                 self.attack_markers.clear();
                 self.selected_attack_markers.clear();
                 self.detect_requested = false;
                 self.active_attack = None;
                 self.audio_info = Some(clip);
+                self.rebuild_audition();
+                if let Some(path) = self.selected_file.clone() {
+                    self.remember_recent(path);
+                }
                 self.error = None;
             }
             Err(error) => self.error = Some(format!("Could not open {}: {error}", path.display())),
@@ -154,6 +216,7 @@ impl SampleWorkbench {
         match project::save(&path, &data) {
             Ok(()) => {
                 self.project_path = Some(path.clone());
+                self.remember_recent(path.clone());
                 self.export_status = Some(format!("Saved {}", path.display()));
                 self.error = None;
             }
@@ -168,14 +231,40 @@ impl SampleWorkbench {
         else {
             return;
         };
+        self.open_project_path(path);
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
         match project::load(&path) {
             Ok(data) => match load_audio(&data.source) {
                 Ok(clip) => {
+                    self.audio_clipboard = None;
                     let frames = clip.samples.len() / usize::from(clip.channels);
+                    let pool_frames =
+                        frames + data.state.inserted.len() / usize::from(clip.channels);
+                    if let Some(pieces) = &data.state.timeline {
+                        let total = pieces
+                            .iter()
+                            .try_fold(0usize, |sum, piece| sum.checked_add(piece.len));
+                        if total.is_none()
+                            || data.state.inserted.len() % usize::from(clip.channels) != 0
+                            || pieces.iter().any(|piece| {
+                                piece.source.is_some_and(|start| {
+                                    start
+                                        .checked_add(piece.len)
+                                        .is_none_or(|end| end > pool_frames)
+                                })
+                            })
+                        {
+                            self.error =
+                                Some("Project timing slices exceed the source audio.".into());
+                            return;
+                        }
+                    }
                     self.attack_markers = data
                         .markers
                         .into_iter()
-                        .filter(|&frame| frame < frames)
+                        .filter(|&frame| frame < pool_frames)
                         .collect();
                     self.attack_markers.sort_unstable();
                     self.attack_markers.dedup();
@@ -191,6 +280,7 @@ impl SampleWorkbench {
                     self.audio_info = Some(clip);
                     let restored_selection = data.selection;
                     self.selection = None;
+                    self.remember_recent(path.clone());
                     self.project_path = Some(path);
                     self.waveform.clear();
                     self.position_seconds = self.range_start();
@@ -212,6 +302,39 @@ impl SampleWorkbench {
         }
     }
 
+    fn prepare_marker_coordinates(&mut self) {
+        if self.bypass_edits {
+            return;
+        }
+        if let Some(source) = &self.original_audio {
+            let channels = usize::from(source.channels);
+            let mut next = self.edits.current.clone();
+            if next.materialize_gaps(source.samples.len() / channels, channels) {
+                self.edits.commit(next);
+            }
+        }
+    }
+
+    fn add_marker_at_playhead(&mut self) {
+        self.prepare_marker_coordinates();
+        let Some(clip) = &self.audio_info else {
+            return;
+        };
+        let frames = clip.samples.len() / usize::from(clip.channels);
+        if frames == 0 {
+            return;
+        }
+        let position = ((self.position_seconds * f64::from(clip.sample_rate)).round() as usize)
+            .min(frames - 1);
+        if let Some(source) = self.source_frame(position) {
+            self.attack_markers.push(source);
+            self.attack_markers.sort_unstable();
+            self.attack_markers.dedup();
+            self.active_attack = Some(source);
+            self.selected_attack_markers = vec![source];
+        }
+    }
+
     fn source_frame(&self, frame: usize) -> Option<usize> {
         let clip = self.original_audio.as_ref()?;
         let total = clip.samples.len() / usize::from(clip.channels);
@@ -230,7 +353,8 @@ impl SampleWorkbench {
             return Vec::new();
         };
         let frames = clip.samples.len() / usize::from(clip.channels);
-        self.attack_markers
+        let mut attacks: Vec<_> = self
+            .attack_markers
             .iter()
             .filter_map(|&source| {
                 let visible = if self.bypass_edits {
@@ -240,7 +364,9 @@ impl SampleWorkbench {
                 };
                 visible.map(|frame| (source, frame))
             })
-            .collect()
+            .collect();
+        attacks.sort_by_key(|&(_, frame)| frame);
+        attacks
     }
 
     fn jump_to_attack(&mut self, source: usize, frame: usize) {
@@ -293,44 +419,6 @@ impl SampleWorkbench {
                 ui.label(format!("Spectral: {} · Envelope: {}",result.spectral.len(),result.legacy.len()));
                 ui.label(RichText::new("Last analysis").small().color(theme::MUTED)).on_hover_text("Generate again after changing detector settings.");
             }
-            }); let visible = self.visible_attacks();
-            ui.horizontal_wrapped(|ui| {
-            let clip = self.audio_info.as_ref().unwrap();
-            let rate = f64::from(clip.sample_rate);
-            let total = clip.samples.len() / usize::from(clip.channels);
-            let position = (self.position_seconds * rate).round() as usize;
-            ui.horizontal(|ui| {
-                let previous = visible.iter().rev().find(|(_, frame)| *frame < position).copied();
-                let next = visible.iter().find(|(_, frame)| *frame > position).copied();
-                if ui.add_enabled(previous.is_some(), theme::icon_button("Previous", theme::Icon::Previous)).clicked() && let Some((source,frame)) = previous { self.jump_to_attack(source,frame); }
-                if ui.add_enabled(next.is_some(), theme::icon_button("Next", theme::Icon::Next)).clicked() && let Some((source,frame)) = next { self.jump_to_attack(source,frame); }
-            });
-            if ui.add_enabled(position < total, theme::icon_button("Add at playhead", theme::Icon::Marker)).clicked() && let Some(source) = self.source_frame(position) {
-                self.attack_markers.push(source);
-                self.attack_markers.sort_unstable(); self.attack_markers.dedup();
-                self.active_attack = Some(source);
-            }
-            let selected = visible.iter().position(|(source,_)| Some(*source) == self.active_attack);
-            egui::ComboBox::from_id_salt("attack_choice").selected_text(selected.map_or("Choose attack".to_owned(), |i| format!("Attack {}",i+1))).show_ui(ui, |ui| {
-                for (i, &(source, frame)) in visible.iter().enumerate() {
-                    if ui.selectable_label(Some(source) == self.active_attack, format!("{} · {:.4} s", i+1, frame as f64 / rate)).clicked() { self.jump_to_attack(source,frame); }
-                }
-            });
-            if let Some(index) = selected {
-                let (source, frame) = visible[index];
-                let mut seconds = frame as f64 / rate;
-                ui.label("Attack position");
-                if ui.add(egui::DragValue::new(&mut seconds).speed(0.0001).range(0.0..=total.saturating_sub(1) as f64 / rate).fixed_decimals(5).suffix(" s")).changed()
-                    && let Some(moved) = self.source_frame((seconds * rate).round() as usize)
-                {
-                    self.attack_markers.retain(|&n| n != source);
-                    self.attack_markers.push(moved); self.attack_markers.sort_unstable(); self.attack_markers.dedup();
-                    self.active_attack = Some(moved);
-                }
-                if ui.button("Remove marker").clicked() { self.attack_markers.retain(|&n| n != source); self.active_attack = None; }
-                let end = visible.get(index+1).map_or(total, |&(_,frame)| frame);
-                if ui.add_enabled(frame < end, egui::Button::new("Select to next attack")).clicked() { self.set_selection(Some(frame..end)); }
-            }
             });
         });
     }
@@ -348,10 +436,14 @@ impl SampleWorkbench {
                         } else {
                             &result.legacy
                         };
-                        self.attack_markers = markers
+                        self.prepare_marker_coordinates();
+                        let mut detected: Vec<usize> = markers
                             .iter()
                             .filter_map(|&frame| self.source_frame(frame))
                             .collect();
+                        detected.sort_unstable();
+                        detected.dedup();
+                        self.attack_markers = detected;
                         self.active_attack = None;
                         self.export_status = None;
                         self.waveform.detection = Some(std::sync::Arc::new(result));
@@ -390,6 +482,7 @@ impl SampleWorkbench {
     }
 
     fn refresh_edits(&mut self) {
+        self.preview_timing = false;
         self.detect_requested = false;
         let old_len = self
             .audio_info
@@ -414,6 +507,7 @@ impl SampleWorkbench {
             self.waveform.invalidate_audio();
         }
         self.export_status = None;
+        self.rebuild_audition();
         self.sync_playback();
         self.reconfigure_playback(false);
     }
@@ -427,12 +521,12 @@ impl SampleWorkbench {
         };
         let frames = source.samples.len() / usize::from(source.channels);
         let ranges = self.edits.current.source_ranges(frames, selection.clone());
-        if ranges.is_empty() {
+        if ranges.is_empty() && self.edits.current.timeline.is_none() {
             return;
         }
         let target = selection.start as f64 / f64::from(source.sample_rate);
         let mut next = self.edits.current.clone();
-        next.deletions.extend(ranges);
+        next.remove_time(frames, selection);
         if self.edits.commit(next) {
             self.refresh_edits();
             self.position_seconds = target.min(self.audio_info.as_ref().unwrap().duration_seconds);
@@ -441,13 +535,20 @@ impl SampleWorkbench {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // Leave keys alone while editing a text/numeric field. Ignore auto-repeat.
-        if ctx.wants_keyboard_input() {
+        let has_clipboard_event = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy | egui::Event::Paste(_)))
+        });
+        if ctx.wants_keyboard_input() && !has_clipboard_event {
             return;
         }
         let keys = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|event| match event {
+                    egui::Event::Copy => Some((egui::Key::C, true, false)),
+                    egui::Event::Paste(_) => Some((egui::Key::V, true, false)),
                     egui::Event::Key {
                         key,
                         pressed: true,
@@ -456,7 +557,8 @@ impl SampleWorkbench {
                         ..
                     } if (!modifiers.ctrl && !modifiers.alt && !modifiers.command)
                         || (*key == egui::Key::Backspace && modifiers.ctrl)
-                        || (*key == egui::Key::Z && modifiers.ctrl) =>
+                        || (matches!(key, egui::Key::Z | egui::Key::C | egui::Key::V)
+                            && modifiers.ctrl) =>
                     {
                         Some((*key, modifiers.ctrl, modifiers.shift))
                     }
@@ -464,7 +566,12 @@ impl SampleWorkbench {
                 })
                 .collect::<Vec<_>>()
         });
+        let mut handled = Vec::new();
         for (key, ctrl, shift) in keys {
+            if handled.contains(&(key, ctrl, shift)) {
+                continue;
+            }
+            handled.push((key, ctrl, shift));
             if matches!(
                 key,
                 egui::Key::Space | egui::Key::Escape | egui::Key::Backspace
@@ -486,6 +593,13 @@ impl SampleWorkbench {
                 });
             }
             match key {
+                egui::Key::C if ctrl => {
+                    self.copy_audio();
+                    if self.audio_clipboard.is_some() {
+                        ctx.copy_text("SampleForge audio selection".to_owned());
+                    }
+                }
+                egui::Key::V if ctrl => self.paste_audio(),
                 egui::Key::Space => {
                     if self.playback.as_ref().is_some_and(|p| !p.sink.is_paused()) {
                         self.playback = None;
@@ -510,6 +624,52 @@ impl SampleWorkbench {
                 _ => (),
             }
         }
+    }
+
+    fn copy_audio(&mut self) {
+        if let (Some(clip), Some(range)) = (&self.audio_info, &self.selection) {
+            let channels = usize::from(clip.channels);
+            self.audio_clipboard =
+                Some(clip.samples[range.start * channels..range.end * channels].to_vec());
+        }
+    }
+
+    fn paste_audio(&mut self) {
+        if self.bypass_edits {
+            return;
+        }
+        let (Some(audio), Some(source), Some(clip)) = (
+            &self.audio_clipboard,
+            &self.original_audio,
+            &self.audio_info,
+        ) else {
+            return;
+        };
+        if audio.is_empty() {
+            return;
+        }
+        let channels = usize::from(clip.channels);
+        let length = audio.len() / channels;
+        let position = ((self.position_seconds * f64::from(clip.sample_rate)).round() as usize)
+            .min(clip.samples.len() / channels);
+        let range = self.selection.clone().unwrap_or(position..position);
+        let start = range.start;
+        let mut next = self.edits.current.clone();
+        next.paste(source.samples.len() / channels, channels, range, audio);
+        if self.edits.commit(next) {
+            self.refresh_edits();
+            self.set_selection(Some(start..start + length));
+        }
+    }
+
+    fn remove_all_markers(&mut self) {
+        self.attack_markers.clear();
+        self.selected_attack_markers.clear();
+        self.active_attack = None;
+        self.preview_timing = false;
+        self.detect_requested = false;
+        self.detection_work = None;
+        self.waveform.compare_legacy = false;
     }
 
     fn delete_selected_markers(&mut self) {
@@ -539,6 +699,26 @@ impl SampleWorkbench {
         let mut changed = false;
         let mut history_changed = false;
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.selection.is_some(),
+                    theme::icon_button("Copy", theme::Icon::Copy),
+                )
+                .on_hover_text("Ctrl+C: copy selected audio")
+                .clicked()
+            {
+                self.copy_audio();
+            }
+            if ui
+                .add_enabled(
+                    self.audio_clipboard.is_some() && !self.bypass_edits,
+                    theme::icon_button("Paste", theme::Icon::Paste),
+                )
+                .on_hover_text("Ctrl+V: replace selection, or insert at playhead")
+                .clicked()
+            {
+                self.paste_audio();
+            }
             if ui
                 .add_enabled(
                     self.selection.is_some() && !self.bypass_edits,
@@ -598,7 +778,10 @@ impl SampleWorkbench {
         if history_changed && let Some(clip) = &self.audio_info {
             self.fade_ms = self.edits.current.fade_frames as f32 * 1000.0 / clip.sample_rate as f32;
         }
-        if self.edits.current.silences.is_empty() && self.edits.current.deletions.is_empty() {
+        if self.edits.current.silences.is_empty()
+            && self.edits.current.deletions.is_empty()
+            && self.edits.current.timeline.is_none()
+        {
             self.bypass_edits = false;
         }
         ui.horizontal_wrapped(|ui| {
@@ -611,7 +794,9 @@ impl SampleWorkbench {
             );
             if ui
                 .add_enabled(
-                    !self.edits.current.silences.is_empty(),
+                    !self.edits.current.silences.is_empty()
+                        || self.edits.current.timeline.is_some()
+                        || !self.edits.current.deletions.is_empty(),
                     theme::icon_button("Apply to all edits", theme::Icon::Save),
                 )
                 .clicked()
@@ -620,15 +805,92 @@ impl SampleWorkbench {
                 let mut next = self.edits.current.clone();
                 next.fade_frames =
                     (self.fade_ms * clip.sample_rate as f32 / 1000.0).round() as usize;
+                let frames = self.original_audio.as_ref().map_or(0, |source| {
+                    source.samples.len() / usize::from(source.channels)
+                });
+                next.apply_edge_fades(frames, next.fade_frames);
                 changed |= self.edits.commit(next);
             }
             changed |= ui
                 .add_enabled(
                     !self.edits.current.silences.is_empty()
-                        || !self.edits.current.deletions.is_empty(),
+                        || !self.edits.current.deletions.is_empty()
+                        || self.edits.current.timeline.is_some(),
                     theme::toggle(&mut self.bypass_edits, "Bypass edits"),
                 )
                 .changed();
+        });
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("BPM");
+                ui.add(
+                    egui::DragValue::new(&mut self.grid_bpm)
+                        .range(30.0..=300.0)
+                        .speed(0.5),
+                );
+                ui.label("Subdivision");
+                egui::ComboBox::from_id_salt("grid_subdivision")
+                    .selected_text(format!("1/{}", self.grid_subdivision))
+                    .show_ui(ui, |ui| {
+                        for value in [1, 2, 4, 8, 16] {
+                            ui.selectable_value(
+                                &mut self.grid_subdivision,
+                                value,
+                                format!("1/{value}"),
+                            );
+                        }
+                    });
+                ui.add(theme::toggle(&mut self.grid_enabled, "Grid"));
+                if ui
+                    .add_enabled(
+                        self.grid_enabled
+                            && !self.bypass_edits
+                            && !self.selected_attack_markers.is_empty(),
+                        theme::icon_button("Preview timing", theme::Icon::Marker),
+                    )
+                    .on_hover_text(
+                        "Show grid targets for selected attacks. Audio changes only when applied.",
+                    )
+                    .clicked()
+                {
+                    self.preview_timing = true;
+                }
+                if self.preview_timing {
+                    if ui
+                        .add(theme::icon_button("Apply timing", theme::Icon::Select))
+                        .clicked()
+                    {
+                        self.apply_timing();
+                    }
+                    if ui
+                        .add(theme::icon_button("Cancel", theme::Icon::Clear))
+                        .clicked()
+                    {
+                        self.preview_timing = false;
+                    }
+                }
+            });
+            if self.preview_timing {
+                let resolved = self.timing_targets();
+                let skipped = self
+                    .requested_timing_targets()
+                    .iter()
+                    .zip(&resolved)
+                    .filter(|(requested, resolved)| requested.1 != resolved.1)
+                    .count();
+                let moved = self
+                    .timing_targets()
+                    .iter()
+                    .filter(|(from, to)| from != to)
+                    .count();
+                ui.label(
+                    RichText::new(format!(
+                        "{moved} attacks targeted · {skipped} kept in place · amber = destination"
+                    ))
+                    .small()
+                    .color(theme::AMBER),
+                );
+            }
         });
         if self.bypass_edits {
             ui.label(
@@ -641,6 +903,73 @@ impl SampleWorkbench {
         }
         if changed {
             self.refresh_edits();
+        }
+    }
+
+    fn timing_targets(&self) -> Vec<(usize, usize)> {
+        let frames = self
+            .audio_info
+            .as_ref()
+            .map_or(0, |clip| clip.samples.len() / usize::from(clip.channels));
+        edits::resolve_targets(&self.requested_timing_targets(), frames)
+    }
+
+    fn requested_timing_targets(&self) -> Vec<(usize, usize)> {
+        let Some(clip) = &self.audio_info else {
+            return Vec::new();
+        };
+        let step = 60.0 * f64::from(clip.sample_rate)
+            / f64::from(self.grid_bpm.max(1.0))
+            / f64::from(self.grid_subdivision.max(1));
+        self.visible_attacks()
+            .into_iter()
+            .map(|(source, frame)| {
+                let target = if self.selected_attack_markers.contains(&source) {
+                    (frame as f64 / step).round() as usize
+                } else {
+                    0
+                };
+                (
+                    frame,
+                    if self.selected_attack_markers.contains(&source) {
+                        (target as f64 * step).round() as usize
+                    } else {
+                        frame
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn apply_timing(&mut self) {
+        if self.bypass_edits || !self.grid_enabled {
+            return;
+        }
+        let Some(source) = &self.original_audio else {
+            return;
+        };
+        let frames = source.samples.len() / usize::from(source.channels);
+        let fade = (self.fade_ms * source.sample_rate as f32 / 1000.0).round() as usize;
+        let targets = self.timing_targets();
+        let moved = targets.iter().filter(|(from, to)| from != to).count();
+        let skipped = self
+            .requested_timing_targets()
+            .iter()
+            .zip(&targets)
+            .filter(|(requested, resolved)| requested.1 != resolved.1)
+            .count();
+        match edits::quantize(&self.edits.current, frames, &targets, fade) {
+            Ok(next) => {
+                if self.edits.commit(next) {
+                    self.refresh_edits();
+                }
+                self.preview_timing = false;
+                self.error = None;
+                self.export_status = Some(format!(
+                    "{moved} attacks moved · {skipped} left in place to avoid collisions or clip edges"
+                ));
+            }
+            Err(error) => self.error = Some(error),
         }
     }
 
@@ -663,6 +992,7 @@ impl SampleWorkbench {
         } else {
             self.position_seconds
         };
+        let clip = self.audition_audio.as_ref().unwrap_or(clip);
         match Playback::new(clip, self.gain, self.looping, start, range) {
             Ok(playback) => {
                 self.position_seconds = start;
@@ -744,7 +1074,7 @@ impl SampleWorkbench {
             self.position_seconds
         };
         if let Some(playback) = &mut self.playback
-            && let Some(clip) = &self.audio_info
+            && let Some(clip) = self.audition_audio.as_ref().or(self.audio_info.as_ref())
         {
             match playback.reconfigure(clip, range, self.looping, self.gain, target) {
                 Ok(()) => {
@@ -768,6 +1098,7 @@ impl SampleWorkbench {
         }
     }
     fn header(&mut self, ctx: &egui::Context) {
+        // Recent-file access is shared across every workflow step.
         egui::TopBottomPanel::top("header")
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(18))
             .show(ctx, |ui| {
@@ -796,6 +1127,30 @@ impl SampleWorkbench {
                         {
                             self.save_project();
                         }
+                        let recent = ui.add(theme::icon_button("Open recent", theme::Icon::Open));
+                        egui::Popup::menu(&recent).show(|ui| {
+                            if self.recent_files.is_empty() {
+                                ui.label("No recent files");
+                            }
+                            for path in self.recent_files.clone() {
+                                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                                if ui
+                                    .button(name)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    if path
+                                        .extension()
+                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("swp"))
+                                    {
+                                        self.open_project_path(path);
+                                    } else {
+                                        self.open_path(path);
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        });
                     });
                 });
                 ui.add_space(3.0);
@@ -918,6 +1273,7 @@ impl SampleWorkbench {
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
+        let mut audition_changed = false;
         egui::SidePanel::left("inspector")
             .exact_width(242.0)
             .resizable(false)
@@ -1042,8 +1398,126 @@ impl SampleWorkbench {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);
+                        theme::eyebrow(ui, "DISTORTION PREVIEW");
+                        audition_changed |= ui
+                            .add(theme::toggle(
+                                &mut self.distortion_enabled,
+                                "Distortion + cab",
+                            ))
+                            .changed();
+                        ui.spacing_mut().slider_width = 65.0;
+                        let drive = ui.add(
+                            egui::Slider::new(&mut self.distortion_drive, 0.0..=48.0)
+                                .text("Drive")
+                                .suffix(" dB"),
+                        );
+                        audition_changed |=
+                            drive.drag_stopped() || (drive.changed() && !drive.dragged());
+                        ui.label(
+                            RichText::new("Audition only · WAV export stays clean")
+                                .small()
+                                .color(theme::MUTED),
+                        );
                     });
             });
+        if audition_changed {
+            self.rebuild_audition();
+            self.reconfigure_playback(false);
+        }
+    }
+
+    fn marker_toolbar(&mut self, ui: &mut egui::Ui) {
+        let visible = self.visible_attacks();
+        let rate = f64::from(self.audio_info.as_ref().unwrap().sample_rate);
+        let position = (self.position_seconds * rate).round() as usize;
+        ui.horizontal(|ui| {
+            let previous = visible
+                .iter()
+                .rev()
+                .find(|(_, frame)| *frame < position)
+                .copied();
+            let next = visible.iter().find(|(_, frame)| *frame > position).copied();
+            if ui
+                .add_enabled(
+                    previous.is_some(),
+                    theme::icon_button("Previous", theme::Icon::Previous),
+                )
+                .clicked()
+                && let Some((source, frame)) = previous
+            {
+                self.jump_to_attack(source, frame);
+            }
+            if ui
+                .add_enabled(
+                    next.is_some(),
+                    theme::icon_button("Next", theme::Icon::Next),
+                )
+                .clicked()
+                && let Some((source, frame)) = next
+            {
+                self.jump_to_attack(source, frame);
+            }
+            if ui
+                .add(theme::icon_button("Add at playhead", theme::Icon::Marker))
+                .clicked()
+            {
+                self.add_marker_at_playhead();
+            }
+            egui::ComboBox::from_id_salt("workspace_attack_picker")
+                .selected_text(
+                    self.active_attack
+                        .and_then(|source| {
+                            visible
+                                .iter()
+                                .position(|&(candidate, _)| candidate == source)
+                        })
+                        .map_or_else(
+                            || "Choose attack".to_owned(),
+                            |index| format!("Attack {}", index + 1),
+                        ),
+                )
+                .show_ui(ui, |ui| {
+                    for (index, &(source, frame)) in visible.iter().enumerate() {
+                        if ui
+                            .selectable_label(
+                                self.active_attack == Some(source),
+                                format!("Attack {}", index + 1),
+                            )
+                            .clicked()
+                        {
+                            self.jump_to_attack(source, frame);
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add(theme::icon_button("Clear", theme::Icon::Clear))
+                .clicked()
+            {
+                self.selected_attack_markers.clear();
+                self.active_attack = None;
+            }
+            if ui
+                .add(theme::icon_button("Select all", theme::Icon::Select))
+                .clicked()
+            {
+                self.selected_attack_markers = visible.iter().map(|&(source, _)| source).collect();
+                self.active_attack = self.selected_attack_markers.first().copied();
+            }
+            ui.label(
+                RichText::new("Marker selection")
+                    .small()
+                    .color(theme::MUTED),
+            );
+            if ui
+                .add(theme::icon_button("Remove all", theme::Icon::Delete))
+                .on_hover_text("Remove all attack markers; audio is unchanged")
+                .clicked()
+            {
+                self.remove_all_markers();
+            }
+        });
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
@@ -1156,6 +1630,44 @@ impl SampleWorkbench {
             });
         ui.add_space(8.0);
         ui.separator();
+        let has_markers = !self.visible_attacks().is_empty();
+        let available = ui.available_width();
+        if has_markers && available >= 1100.0 {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(available - 490.0 - ui.spacing().item_spacing.x, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(available - 490.0 - ui.spacing().item_spacing.x);
+                        self.waveform.controls(
+                            ui,
+                            self.audio_info.as_ref().unwrap(),
+                            self.selection.as_ref(),
+                        );
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(490.0, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| self.marker_toolbar(ui),
+                );
+            });
+        } else {
+            self.waveform.controls(
+                ui,
+                self.audio_info.as_ref().unwrap(),
+                self.selection.as_ref(),
+            );
+            if has_markers {
+                self.marker_toolbar(ui);
+            }
+        }
+        self.waveform.timing_targets =
+            if self.preview_timing && self.grid_enabled && !self.bypass_edits {
+                self.timing_targets()
+            } else {
+                Vec::new()
+            };
         let clip = self
             .audio_info
             .as_ref()
@@ -1177,17 +1689,26 @@ impl SampleWorkbench {
             .iter()
             .find(|&&(source, _)| Some(source) == self.active_attack)
             .map(|&(_, frame)| frame);
-        let action = self
-            .waveform
-            .show(ui, clip, self.gain, progress, self.selection.as_ref());
+        let action = self.waveform.show(
+            ui,
+            clip,
+            self.gain,
+            progress,
+            self.selection.as_ref(),
+            self.grid_bpm,
+            self.grid_subdivision,
+            self.grid_enabled,
+        );
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             for (keys, action, color) in [
-                ("DRAG", "Seek", theme::ACCENT),
-                ("SHIFT + DRAG", "Select audio", theme::AMBER),
+                ("CLICK", "Seek", theme::ACCENT),
+                ("DRAG", "Select audio", theme::AMBER),
                 ("CTRL + CLICK / DRAG", "Select markers", theme::TEXT),
                 ("MIDDLE / RIGHT DRAG", "Pan", theme::MUTED),
                 ("SPACE", "Play / stop", theme::ACCENT),
+                ("CTRL+C / V", "Copy / paste audio", theme::TEXT),
+                ("BACKSPACE", "Delete audio", theme::MUTED),
             ] {
                 ui.label(RichText::new(keys).monospace().small().color(color));
                 ui.label(RichText::new(action).small().color(theme::MUTED));
@@ -1197,6 +1718,9 @@ impl SampleWorkbench {
         if let Some(action) = action {
             match action {
                 WaveformAction::Seek(fraction) => {
+                    self.selection = None;
+                    self.selection_pending = true;
+                    self.reconfigure_playback(false);
                     let target = fraction * duration;
                     if let Some(playback) = &self.playback {
                         match playback.seek(target) {
@@ -1218,6 +1742,17 @@ impl SampleWorkbench {
                         .iter()
                         .filter_map(|&(source, frame)| frames.contains(&frame).then_some(source))
                         .collect();
+                    self.active_attack = self.selected_attack_markers.first().copied();
+                }
+                WaveformAction::AddMarkers(frames) => {
+                    for source in attacks
+                        .iter()
+                        .filter_map(|&(source, frame)| frames.contains(&frame).then_some(source))
+                    {
+                        if !self.selected_attack_markers.contains(&source) {
+                            self.selected_attack_markers.push(source);
+                        }
+                    }
                     self.active_attack = self.selected_attack_markers.first().copied();
                 }
             }
@@ -1280,6 +1815,131 @@ impl eframe::App for SampleWorkbench {
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
+    #[test]
+    fn add_marker_at_playhead_uses_rendered_position_after_edits() {
+        let mut app = app();
+        app.position_seconds = 0.6;
+        app.add_marker_at_playhead();
+        assert_eq!(app.attack_markers, vec![6]);
+        assert_eq!(app.selected_attack_markers, vec![6]);
+        app.selection = Some(2..4);
+        app.delete_selection();
+        app.position_seconds = 0.6;
+        app.add_marker_at_playhead();
+        assert_eq!(app.attack_markers, vec![6, 8]);
+    }
+    #[test]
+    fn distortion_preview_does_not_change_export_clip() {
+        let mut app = app();
+        let clean = app.audio_info.as_ref().unwrap().samples.clone();
+        app.distortion_enabled = true;
+        app.rebuild_audition();
+        assert_eq!(app.audio_info.as_ref().unwrap().samples, clean);
+        assert!(app.audition_audio.is_some());
+        app.distortion_enabled = false;
+        app.rebuild_audition();
+        assert!(app.audition_audio.is_none());
+    }
+    #[test]
+    fn native_clipboard_events_do_not_double_paste() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        app.selection = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL,
+                    },
+                    egui::Event::Paste(String::new()),
+                ],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.audio_info.as_ref().unwrap().samples.len(), 12);
+    }
+    #[test]
+    fn copy_paste_insert_replace_delete_and_undo_preserve_snapshot() {
+        let mut app = app();
+        app.copy_audio(); // [2, 3]
+        app.selection = None;
+        app.position_seconds = 0.5;
+        app.paste_audio();
+        assert_eq!(
+            app.audio_info.as_ref().unwrap().samples.as_ref(),
+            &[0., 1., 2., 3., 4., 2., 3., 5., 6., 7., 8., 9.]
+        );
+        assert_eq!(app.selection, Some(5..7));
+        app.paste_audio(); // replacement, not another insertion
+        assert_eq!(app.audio_info.as_ref().unwrap().samples.len(), 12);
+        app.delete_selection();
+        assert_eq!(
+            app.audio_info.as_ref().unwrap().samples.as_ref(),
+            &[0., 1., 2., 3., 4., 5., 6., 7., 8., 9.]
+        );
+        app.undo_edit();
+        assert_eq!(app.audio_info.as_ref().unwrap().samples.len(), 12);
+        app.selection = Some(0..12);
+        app.delete_selection();
+        assert!(app.audio_info.as_ref().unwrap().samples.is_empty());
+        app.paste_audio();
+        assert_eq!(app.audio_info.as_ref().unwrap().samples.as_ref(), &[2., 3.]);
+    }
+
+    #[test]
+    fn removing_all_markers_preserves_audio_and_selection() {
+        let mut app = app();
+        app.attack_markers = vec![1, 3];
+        app.selected_attack_markers = vec![1];
+        let audio = app.audio_info.as_ref().unwrap().samples.clone();
+        app.remove_all_markers();
+        assert!(app.attack_markers.is_empty());
+        assert!(app.selected_attack_markers.is_empty());
+        assert_eq!(app.selection, Some(2..4));
+        assert_eq!(app.audio_info.as_ref().unwrap().samples, audio);
+    }
+    #[test]
+    fn timing_uses_rendered_grid_preserves_markers_loop_and_bypass() {
+        let mut app = app();
+        app.attack_markers = vec![1, 6];
+        app.delete_selection();
+        app.selected_attack_markers = vec![6];
+        app.grid_enabled = true;
+        app.preview_timing = true;
+        app.looping = true;
+        app.selection = Some(0..7);
+        let before = app.audio_info.as_ref().unwrap().samples.clone();
+        assert_eq!(app.timing_targets(), vec![(1, 1), (4, 5)]);
+        assert_eq!(app.audio_info.as_ref().unwrap().samples, before);
+        app.apply_timing();
+        assert_eq!(app.attack_markers, vec![1, 6]);
+        assert_eq!(app.visible_attacks(), vec![(1, 1), (6, 5)]);
+        assert_eq!(app.audio_info.as_ref().unwrap().samples[5], 6.0);
+        assert_eq!(app.selection, Some(0..7));
+        assert!(app.looping);
+        app.undo_edit();
+        assert_eq!(app.audio_info.as_ref().unwrap().samples, before);
+        app.redo_edit();
+        assert_eq!(app.visible_attacks(), vec![(1, 1), (6, 5)]);
+        app.bypass_edits = true;
+        app.refresh_edits();
+        assert_eq!(
+            app.audio_info.as_ref().unwrap().samples,
+            app.original_audio.as_ref().unwrap().samples
+        );
+    }
     #[test]
     fn attack_markers_follow_cuts_and_return_on_undo() {
         let mut app = app();

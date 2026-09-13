@@ -107,6 +107,8 @@ mod tests {
                 silences: std::iter::once(1..2).collect(),
                 fade_frames: 0,
                 deletions: Vec::new(),
+                timeline: None,
+                inserted: Vec::new(),
             },
         );
         let mut bytes = Cursor::new(Vec::new());
@@ -118,6 +120,22 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(samples, vec![0.05, -0.05, 0.0, 0.0, 0.6, -0.7]);
+    }
+    #[test]
+    fn exported_timing_is_the_auditioned_sample_data() {
+        let original = clip();
+        let state = crate::edits::quantize(&Default::default(), 3, &[(1, 2)], 0).unwrap();
+        let rendered = crate::edits::render(&original, &state);
+        let mut bytes = Cursor::new(Vec::new());
+        write_region(&mut bytes, &rendered, 0..3, 1.0).unwrap();
+        bytes.set_position(0);
+        let samples = hound::WavReader::new(bytes)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples, rendered.samples.as_ref());
+        assert_eq!(&samples[4..6], &original.samples[2..4]);
     }
     #[test]
     fn invalid_regions_and_gain_are_rejected() {
